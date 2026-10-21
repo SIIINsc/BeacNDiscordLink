@@ -1,0 +1,7 @@
+# Never commit local OAuth tokens or personal config overrides
+token_cache.json
+config.json
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store

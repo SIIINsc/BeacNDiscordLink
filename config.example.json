@@ -1,0 +1,13 @@
+{
+  "client_id": "1224385725949284403",
+  "client_secret": "",
+  "redirect_uri": "http://127.0.0.1",
+  "mic_channel_name": "Mic",
+  "chat_channel_name": "Chat",
+  "only_button_mute": true,
+  "include_knob_press_mute": false,
+  "deafen_when_only_chat_muted": false,
+  "poll_interval_ms": 50,
+  "discord_target": "both",
+  "beacn_profile_override": ""
+}
