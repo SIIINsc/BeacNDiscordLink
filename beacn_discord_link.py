@@ -273,7 +273,7 @@ class DiscordKeybindController:
                 if not self.is_muted:
                     if not dry_run:
                         send_keybind(self.mute_key)
-                        time.sleep(0.06)
+                        time.sleep(0.15)
                     self.is_muted = True
                     triggered.append(f"{self.mute_key} (Mute)")
                 if not dry_run:
@@ -288,7 +288,7 @@ class DiscordKeybindController:
                 if not dry_run:
                     send_keybind(self.deafen_key)
                     if not target_mute:
-                        time.sleep(0.06)
+                        time.sleep(0.15)
                 self.is_deafened = False
                 triggered.append(f"{self.deafen_key} (Undeafen)")
 
@@ -432,6 +432,7 @@ def find_rtti_vtable_rvas(exe_path: str) -> Dict[str, int]:
         rdata = pe[rdata_roff : rdata_roff + rdata_rsize]
 
         for label, cls_bytes in [
+            ("RefCountFaderData", b".?AV?$_Ref_count@VfaderData@@@std@@\x00"),
             ("MixerData", b".?AVMixerData@@\x00"),
             ("MixerComponent", b".?AVMixerComponent@@\x00"),
             ("MixCreateMixerKnobAppUI", b".?AVMixCreateMixerKnobAppUI@@\x00"),
@@ -602,7 +603,10 @@ class BeacNMemoryMonitor:
 
         ui_vtable_list: List[bytes] = []
         data_vtable_bytes = None
+        ref_fader_vtable_bytes = None
         if self.base_addr and self.vtable_rvas:
+            if "RefCountFaderData" in self.vtable_rvas:
+                ref_fader_vtable_bytes = struct.pack("<Q", self.base_addr + self.vtable_rvas["RefCountFaderData"])
             for k in ("MixCreateMixerKnobAppUI", "MixerComponent"):
                 if k in self.vtable_rvas:
                     ui_vtable_list.append(struct.pack("<Q", self.base_addr + self.vtable_rvas[k]))
@@ -634,25 +638,38 @@ class BeacNMemoryMonitor:
             ):
                 chunk = self._read_mem(base, size)
                 if chunk:
-                    # 1. Check MixCreateMixerKnobAppUI / MixerComponent instances (active live UI/Hardware channels)
+                    # 1. Check std::_Ref_count<faderData> control blocks (_Uses >= 2 means Live UI + MixerData)
+                    if ref_fader_vtable_bytes:
+                        pos = 0
+                        while (pos := chunk.find(ref_fader_vtable_bytes, pos)) != -1:
+                            if pos + 0x18 <= len(chunk):
+                                uses, weaks, ch_ptr = struct.unpack_from("<IIQ", chunk, pos + 0x08)
+                                if uses >= 2 and 1 <= weaks <= 16 and ch_ptr not in candidate_ptrs:
+                                    candidate_ptrs.insert(0, ch_ptr)
+                                elif uses == 1 and 1 <= weaks <= 16 and ch_ptr not in candidate_ptrs:
+                                    candidate_ptrs.append(ch_ptr)
+                            pos += 8
+
+                    # 2. Check MixCreateMixerKnobAppUI / MixerComponent instances (active live UI/Hardware channels)
                     for vt_bytes in ui_vtable_list:
                         pos = 0
                         while (pos := chunk.find(vt_bytes, pos)) != -1:
                             if pos + 0x158 <= len(chunk):
                                 ch_ptr = struct.unpack_from("<Q", chunk, pos + 0x150)[0]
                                 if ch_ptr not in candidate_ptrs:
-                                    candidate_ptrs.append(ch_ptr)
+                                    candidate_ptrs.insert(0, ch_ptr)
                             pos += 8
 
-                    # 2. Check live MixerData instance ([MixerData + 0xC8] != 0 is Live, == 0 is Snapshot)
+                    # 3. Check live MixerData instance ([MixerData + 0x48] == 0 or [MixerData + 0xC8] != 0)
                     if data_vtable_bytes:
                         pos = 0
                         while (pos := chunk.find(data_vtable_bytes, pos)) != -1:
                             if pos + 0xD0 <= len(chunk):
+                                is_snap = struct.unpack_from("<I", chunk, pos + 0x48)[0]
                                 snapshot_ptr = struct.unpack_from("<Q", chunk, pos + 0xC8)[0]
                                 vec_begin, vec_end = struct.unpack_from("<QQ", chunk, pos + 0x60)
                                 count = (vec_end - vec_begin) // 16
-                                if snapshot_ptr != 0 and 1 <= count <= 16:
+                                if (is_snap == 0 or snapshot_ptr != 0) and 1 <= count <= 16:
                                     vec_raw = self._read_mem(vec_begin, count * 16)
                                     if vec_raw:
                                         for i in range(count):
