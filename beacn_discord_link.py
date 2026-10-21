@@ -431,7 +431,11 @@ def find_rtti_vtable_rvas(exe_path: str) -> Dict[str, int]:
         _, rdata_vsize, rdata_vaddr, rdata_rsize, rdata_roff = rdata_sec[0]
         rdata = pe[rdata_roff : rdata_roff + rdata_rsize]
 
-        for label, cls_bytes in [("MixerData", b".?AVMixerData@@\x00"), ("MixerComponent", b".?AVMixerComponent@@\x00")]:
+        for label, cls_bytes in [
+            ("MixerData", b".?AVMixerData@@\x00"),
+            ("MixerComponent", b".?AVMixerComponent@@\x00"),
+            ("MixCreateMixerKnobAppUI", b".?AVMixCreateMixerKnobAppUI@@\x00"),
+        ]:
             idx = pe.find(cls_bytes)
             if idx == -1:
                 continue
@@ -537,19 +541,13 @@ class BeacNMemoryMonitor:
         if lock_st not in (0, 1) or linked not in (0, 1):
             return None
 
-        vol_ratio, hp_lvl, br_lvl = struct.unpack_from("<fff", raw, 0x0C)
-        if not (math.isfinite(vol_ratio) and math.isfinite(hp_lvl) and math.isfinite(br_lvl)):
-            return None
-        if not (0.0 <= vol_ratio <= 2.0 and 0.0 <= hp_lvl <= 1.001 and 0.0 <= br_lvl <= 1.001):
-            return None
-
         # Route mute flags (+0x18 .. +0x1D)
         for offset in range(0x18, 0x1E):
             if raw[offset] not in (0, 1):
                 return None
 
         place_in_order, _, knob_type = struct.unpack_from("<iii", raw, 0x20)
-        if not (0 <= place_in_order <= 16 and 1 <= knob_type <= 10):
+        if not (0 <= place_in_order <= 16 and 1 <= knob_type <= 32):
             return None
 
         knob_mute_mode, btn_mute_mode = struct.unpack_from("<ii", raw, 0x50)
@@ -593,8 +591,8 @@ class BeacNMemoryMonitor:
 
     def _locate_live_channels(self) -> bool:
         """
-        Scan BEACN.exe heap for the live MixerComponent / MixerData objects
-        to obtain the exact pointers to the live Mic and Chat MixerChannel structs.
+        Scan BEACN.exe heap for the live MixCreateMixerKnobAppUI / MixerComponent / MixerData
+        objects to obtain the exact pointers to the live Mic and Chat MixerChannel structs.
         """
         if not self.h_proc:
             return False
@@ -602,11 +600,12 @@ class BeacNMemoryMonitor:
         mic_target = self.cfg.get("mic_channel_name", "Mic").strip().lower()
         chat_target = self.cfg.get("chat_channel_name", "Chat").strip().lower()
 
-        comp_vtable_bytes = None
+        ui_vtable_list: List[bytes] = []
         data_vtable_bytes = None
         if self.base_addr and self.vtable_rvas:
-            if "MixerComponent" in self.vtable_rvas:
-                comp_vtable_bytes = struct.pack("<Q", self.base_addr + self.vtable_rvas["MixerComponent"])
+            for k in ("MixCreateMixerKnobAppUI", "MixerComponent"):
+                if k in self.vtable_rvas:
+                    ui_vtable_list.append(struct.pack("<Q", self.base_addr + self.vtable_rvas[k]))
             if "MixerData" in self.vtable_rvas:
                 data_vtable_bytes = struct.pack("<Q", self.base_addr + self.vtable_rvas["MixerData"])
 
@@ -635,25 +634,25 @@ class BeacNMemoryMonitor:
             ):
                 chunk = self._read_mem(base, size)
                 if chunk:
-                    # 1. Check MixerComponent instances (only exist for active live UI/Hardware channels)
-                    if comp_vtable_bytes:
+                    # 1. Check MixCreateMixerKnobAppUI / MixerComponent instances (active live UI/Hardware channels)
+                    for vt_bytes in ui_vtable_list:
                         pos = 0
-                        while (pos := chunk.find(comp_vtable_bytes, pos)) != -1:
+                        while (pos := chunk.find(vt_bytes, pos)) != -1:
                             if pos + 0x158 <= len(chunk):
                                 ch_ptr = struct.unpack_from("<Q", chunk, pos + 0x150)[0]
                                 if ch_ptr not in candidate_ptrs:
                                     candidate_ptrs.append(ch_ptr)
                             pos += 8
 
-                    # 2. Check live MixerData instance ([MixerData + 0x48] == 0 is Live, == 1 is Snapshot)
+                    # 2. Check live MixerData instance ([MixerData + 0xC8] != 0 is Live, == 0 is Snapshot)
                     if data_vtable_bytes:
                         pos = 0
                         while (pos := chunk.find(data_vtable_bytes, pos)) != -1:
-                            if pos + 0x70 <= len(chunk):
-                                is_snapshot = struct.unpack_from("<I", chunk, pos + 0x48)[0]
+                            if pos + 0xD0 <= len(chunk):
+                                snapshot_ptr = struct.unpack_from("<Q", chunk, pos + 0xC8)[0]
                                 vec_begin, vec_end = struct.unpack_from("<QQ", chunk, pos + 0x60)
                                 count = (vec_end - vec_begin) // 16
-                                if is_snapshot == 0 and 1 <= count <= 16:
+                                if snapshot_ptr != 0 and 1 <= count <= 16:
                                     vec_raw = self._read_mem(vec_begin, count * 16)
                                     if vec_raw:
                                         for i in range(count):
